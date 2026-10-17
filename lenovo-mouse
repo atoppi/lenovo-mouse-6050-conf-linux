@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Configure a Lenovo Wireless Multi-Mode Pro Plus Mouse 6050 over Bluetooth LE on Linux.
+
+Talks to the mouse's vendor GATT service (c1d02500-...) through BlueZ, using the
+same frames Lenovo Accessories and Display Manager sends on Windows:
+
+    request:  00 <payload_len> <group> <cmd> 00 <seq> <payload...>
+    reply:    02 <payload_len> <group> <cmd> 00 <seq> <payload...>
+
+A "get" is the "set" command with the high bit set (cmd | 0x80).
+
+Commands (all seen in captures of the Windows app, 2026-10-17):
+    04 03 / 04 83  DPI stages     00 <count 1-3> <active, 0-based> {X Y big-endian u16}*count
+    04 0a / 04 8a  wheel accel    <enabled 0/1> <level 0-2>  (off / low / medium / high)
+             02 81  button list   00 <count> 00 00 <ids...>
+    02 04 / 02 84  button actions <7 ids, zero padded> {00 <type> <param> <x> <speed> 00 00}*n
+    00 09          restore defaults (payload 02), the app's "Restore Default" button
+    07 82          battery (get)
+    07 83          dim/sleep/off timers (get only; the app never sets them)
+
+Firmware-update commands (group 0x09) are refused on purpose.
+No dependencies beyond Python 3 and systemd's busctl (talks to BlueZ over D-Bus).
+"""
+import argparse
+import json
+import random
+import subprocess
+import sys
+import time
+
+SERVICE_UUID = "c1d02500-2d1f-400a-95d2-6a2f7bca0c25"
+WRITE_UUID = "c1d02501-2d1f-400a-95d2-6a2f7bca0c25"
+NOTIFY_UUID = "c1d02502-2d1f-400a-95d2-6a2f7bca0c25"
+FIRMWARE_UUID = "00002a26-0000-1000-8000-00805f9b34fb"  # Device Information: Firmware Revision
+CHAR_IFACE = "org.bluez.GattCharacteristic1"
+
+# Set commands this script may send: exactly the ones the Windows app sends.
+SAFE_SETS = {(0x04, 0x03), (0x04, 0x0A), (0x02, 0x04), (0x00, 0x09)}
+FORBIDDEN_GROUPS = {0x09}  # firmware update
+
+BUTTON_NAMES = {0x01: "left", 0x02: "right", 0x03: "middle", 0x04: "back", 0x05: "forward",
+                0x08: "dpi", 0x0A: "wheel up", 0x0B: "wheel down", 0x0C: "tilt left", 0x0D: "tilt right"}
+BUTTON_GROUPS = [bytes([0x01, 0x02, 0x03, 0x04, 0x05, 0x08]), bytes([0x0A, 0x0B, 0x0C, 0x0D])]
+# App labels -> bytes, matched against the Windows captures and screenshots.
+HSCROLL_SPEED = {"low": 50, "medium": 100, "high": 200}             # "Left/Right Scroll Speed"
+WHEEL_ACCEL = {"off": bytes([0, 1]), "low": bytes([1, 0]),          # "Wheel Acceleration"
+               "medium": bytes([1, 1]), "high": bytes([1, 2])}      # <enabled> <level>
+
+# Factory defaults, read from the mouse right after the app's "Restore Default" (2026-10-17).
+DEFAULTS = {
+    "dpi": bytes.fromhex("00 03 01 06 40 06 40 09 60 09 60 0f a0 0f a0"),  # 1600/2400/4000, DPI 2 active
+    "wheel": WHEEL_ACCEL["medium"],
+    "buttons": [
+        bytes.fromhex("01 02 03 04 05 08 00"
+                      "00 01 01 00 00 00 00"     # left    -> button 1
+                      "00 01 02 00 00 00 00"     # right   -> button 2
+                      "00 01 03 00 00 00 00"     # middle  -> button 3
+                      "00 01 04 00 00 00 00"     # back    -> button 4
+                      "00 01 05 00 00 00 00"     # forward -> button 5
+                      "00 0f 00 01 00 00 00"),   # dpi     -> cycle DPI
+        bytes.fromhex("0a 0b 0c 0d 00 00 00"
+                      "00 04 01 00 00 00 00"     # wheel up   -> scroll +1
+                      "00 04 ff 00 00 00 00"     # wheel down -> scroll -1
+                      "00 07 ff 00 64 00 00"     # tilt left  -> h-scroll left, speed 100
+                      "00 07 01 00 64 00 00"),   # tilt right -> h-scroll right, speed 100
+    ],
+}
+
+
+class NoReply(Exception):
+    pass
+
+
+def hexs(b):
+    return " ".join(f"{x:02x}" for x in b)
+
+
+def busctl(path, iface, method, *args):
+    """Call a BlueZ D-Bus method with systemd's busctl and return its JSON reply data."""
+    cmd = ["busctl", "--system", "--json=short", "call", "org.bluez", path, iface, method,
+           *map(str, args)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        sys.exit("busctl not found (it is part of systemd)")
+    if r.returncode:
+        raise NoReply(r.stderr.strip() or f"busctl {method} failed")
+    return json.loads(r.stdout)["data"] if r.stdout.strip() else None
+
+
+class Mouse:
+    def __init__(self, mac=None, verbose=False):
+        self.verbose = verbose
+        self.wpath, self.npath = self._find_chars(mac)
+        self.seq = random.randint(0x20, 0xF0)
+
+    def _find_chars(self, mac):
+        objs = busctl("/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")[0]
+        # busctl wraps every property value as {"type": ..., "data": ...}; unwrap them
+        objs = {p: {i: {k: v["data"] for k, v in props.items()} for i, props in ifs.items()}
+                for p, ifs in objs.items()}
+        services = [p for p, ifs in objs.items()
+                    if ifs.get("org.bluez.GattService1", {}).get("UUID") == SERVICE_UUID]
+        if mac:
+            dev = "dev_" + mac.upper().replace(":", "_")
+            services = [p for p in services if f"/{dev}/" in p]
+        if not services:
+            sys.exit("Mouse vendor service not found. Is the mouse connected over Bluetooth?")
+        svc = services[0]
+        dev = svc.rsplit("/", 1)[0]
+        self.fwpath = next((p for p, ifs in objs.items() if p.startswith(dev + "/")
+                            and ifs.get(CHAR_IFACE, {}).get("UUID") == FIRMWARE_UUID), None)
+        chars = {ifs[CHAR_IFACE]["UUID"]: p for p, ifs in objs.items()
+                 if p.startswith(svc + "/") and CHAR_IFACE in ifs}
+        if WRITE_UUID not in chars or NOTIFY_UUID not in chars:
+            sys.exit("Vendor characteristics not found on the mouse.")
+        return chars[WRITE_UUID], chars[NOTIFY_UUID]
+
+    def firmware(self):
+        if not self.fwpath:
+            return "unknown"
+        return bytes(busctl(self.fwpath, CHAR_IFACE, "ReadValue", "a{sv}", 0)[0]).decode("ascii", "replace")
+
+    def _read(self):
+        return bytes(busctl(self.npath, CHAR_IFACE, "ReadValue", "a{sv}", 0)[0])
+
+    def request(self, group, cmd, payload=b""):
+        if group in FORBIDDEN_GROUPS:
+            raise SystemExit(f"refusing group {group:#04x} (firmware update)")
+        self.seq = (self.seq + 1) & 0xFF
+        frame = bytes([0x00, len(payload), group, cmd, 0x00, self.seq]) + bytes(payload)
+        if self.verbose:
+            print(">>", hexs(frame), file=sys.stderr)
+        busctl(self.wpath, CHAR_IFACE, "WriteValue", "aya{sv}", len(frame), *frame,
+               1, "type", "s", "request")
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+            r = self._read()
+            if len(r) >= 6 and r[0] & 0x0F == 2 and r[2] == group and r[3] == cmd and r[5] == self.seq:
+                if self.verbose:
+                    print("<<", hexs(r), file=sys.stderr)
+                return r[6:6 + r[1]]
+        raise NoReply(f"no reply to {group:02x} {cmd:02x} (seq {self.seq:02x})")
+
+    def get(self, group, cmd, payload=b""):
+        return self.request(group, cmd | 0x80, payload)
+
+    def set(self, group, cmd, payload):
+        if (group, cmd) not in SAFE_SETS:
+            raise SystemExit(f"{group:02x} {cmd:02x} is not a known-safe set command")
+        return self.request(group, cmd, payload)
+
+    # -- buttons --
+    def get_buttons(self, ids):
+        """Return {id: 7-byte action} for up to 7 button ids."""
+        p = self.get(0x02, 0x04, ids.ljust(7, b"\0"))
+        n = len(ids)
+        return {p[i]: p[7 + 7 * i:14 + 7 * i] for i in range(n)}
+
+    def set_buttons(self, actions):
+        """actions: {id: 7-byte action}, at most 7 per frame."""
+        items = list(actions.items())
+        for k in range(0, len(items), 7):
+            chunk = items[k:k + 7]
+            ids = bytes(i for i, _ in chunk).ljust(7, b"\0")
+            self.set(0x02, 0x04, ids + b"".join(a for _, a in chunk))
+
+
+# ---- encoders / decoders ---------------------------------------------------
+
+def encode_dpi(stages, active):
+    # `active` is 1-3 as in the app; on the wire it is 0-based (the DPI button cycles 00 -> 01 -> 02).
+    if not 1 <= len(stages) <= 3:
+        raise SystemExit("give 1 to 3 DPI stages")
+    if not 1 <= active <= len(stages):
+        raise SystemExit(f"--active must be between 1 and {len(stages)}")
+    for d in stages:
+        if not (100 <= d <= 4000 and d % 100 == 0):
+            raise SystemExit(f"DPI {d}: use multiples of 100 between 100 and 4000")
+    out = bytearray([0x00, len(stages), active - 1])
+    for d in stages:
+        out += d.to_bytes(2, "big") * 2  # same value for X and Y
+    return bytes(out)
+
+
+def decode_dpi(p):
+    if len(p) < 3:
+        return f"  raw: {hexs(p)}"
+    n, active = p[1], p[2]
+    lines = []
+    for i in range(n):
+        x = int.from_bytes(p[3 + 4 * i:5 + 4 * i], "big")
+        y = int.from_bytes(p[5 + 4 * i:7 + 4 * i], "big")
+        lines.append(f"  DPI {i + 1}: {x} x {y}{'   <- active' if i == active else ''}")
+    return "\n".join(lines)
+
+
+def describe_action(e):
+    kind, param, speed = e[1], e[2], e[4]
+    if kind == 0x01:
+        return BUTTON_NAMES.get(param, f"button {param}") + " click"
+    if kind == 0x04:
+        return "scroll " + ("down" if param == 0xFF else "up")
+    if kind == 0x07:
+        label = next((k for k, v in HSCROLL_SPEED.items() if v == speed), str(speed))
+        return f"h-scroll {'left' if param == 0xFF else 'right'}, speed {label}"
+    if kind == 0x0F:
+        return "cycle DPI"
+    return f"unknown ({hexs(e)})"
+
+
+def describe_wheel(w):
+    return next((k for k, v in WHEEL_ACCEL.items() if v == bytes(w)), f"raw {hexs(w)}")
+
+
+def decode_time(p):
+    if len(p) < 10:
+        return f"  raw: {hexs(p)}"
+    return (f"  dim:   ctrl={p[0]} level={p[1]} time={int.from_bytes(p[2:4], 'big')}\n"
+            f"  sleep: ctrl={p[4]} time={int.from_bytes(p[5:7], 'big')} s\n"
+            f"  off:   ctrl={p[7]} time={int.from_bytes(p[8:10], 'big')}")
+
+
+def action(kind, param, speed=0, x=0):
+    return bytes([0x00, kind, param, x, speed, 0x00, 0x00])
+
+
+# ---- CLI --------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  lenovo-mouse status\n"
+               "  lenovo-mouse dpi 800                      # single DPI level\n"
+               "  lenovo-mouse dpi 1600 2400 4000 --active 2\n"
+               "  lenovo-mouse wheel-accel off|low|medium|high\n"
+               "  lenovo-mouse hscroll-speed low|medium|high\n"
+               "  lenovo-mouse swap-buttons on|off\n"
+               "  lenovo-mouse restore                      # back to factory defaults\n"
+               "  lenovo-mouse help <command>               # details for one command")
+    ap.add_argument("--mac", help="mouse address, if more than one is connected")
+    ap.add_argument("-v", "--verbose", action="store_true", help="print raw frames")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("help", help="show this help, or help for one command")
+    p.add_argument("topic", nargs="?")
+
+    sub.add_parser("status", help="show firmware, battery, DPI, wheel, buttons and timers")
+
+    p = sub.add_parser("dpi", help="set DPI stages, e.g.: dpi 1600 2400 4000 --active 1")
+    p.add_argument("stages", type=int, nargs="+")
+    p.add_argument("--active", type=int, default=1, help="selected stage, 1-3 as in the app (default 1)")
+
+    p = sub.add_parser("wheel-accel", help="wheel acceleration, as in the app")
+    p.add_argument("level", choices=list(WHEEL_ACCEL))
+
+    p = sub.add_parser("swap-buttons", help="swap left/right buttons (left-handed)")
+    p.add_argument("state", choices=["on", "off"])
+
+    p = sub.add_parser("hscroll-speed", help="left/right (tilt) scroll speed, as in the app")
+    p.add_argument("speed", choices=list(HSCROLL_SPEED))
+
+    sub.add_parser("restore", help="write back the saved factory defaults and verify them")
+    sub.add_parser("factory-reset", help="send the app's own 'Restore Default' command")
+
+    p = sub.add_parser("raw-get", help="send any read-only get, e.g.: raw-get 07 83")
+    p.add_argument("group"); p.add_argument("command")
+    p.add_argument("payload", nargs="*", help="optional payload bytes in hex")
+
+    a = ap.parse_args()
+    if a.cmd in (None, "help"):
+        topic = getattr(a, "topic", None)
+        if topic and topic in sub.choices:
+            sub.choices[topic].print_help()
+        else:
+            ap.print_help()
+        return
+    m = Mouse(a.mac, a.verbose)
+
+    if a.cmd == "status":
+        def show(label, fn):
+            try:
+                print(f"{label}:{fn()}")
+            except NoReply as e:
+                print(f"{label}: {e}")
+
+        def battery():
+            b = m.get(0x07, 0x02)
+            return f" {b[1] if len(b) > 1 else '?'}%"
+
+        def wheel():
+            return " " + describe_wheel(m.get(0x04, 0x0A))
+
+        def buttons():
+            lst = m.get(0x02, 0x01)
+            ids = bytes(lst[4:4 + lst[1]])
+            acts = {}
+            for k in range(0, len(ids), 7):
+                acts.update(m.get_buttons(ids[k:k + 7]))
+            return "".join(f"\n  {BUTTON_NAMES.get(i, hex(i)):>10}: {describe_action(e)}"
+                           for i, e in acts.items())
+
+        print(f"firmware: {m.firmware()}")
+        show("battery", battery)
+        show("dpi", lambda: "\n" + decode_dpi(m.get(0x04, 0x03)))
+        show("wheel acceleration", wheel)
+        show("buttons", buttons)
+        show("timers (read-only)", lambda: "\n" + decode_time(m.get(0x07, 0x03)))
+
+    elif a.cmd == "dpi":
+        m.set(0x04, 0x03, encode_dpi(a.stages, a.active))
+        print("dpi:\n" + decode_dpi(m.get(0x04, 0x03)))
+
+    elif a.cmd == "wheel-accel":
+        m.set(0x04, 0x0A, WHEEL_ACCEL[a.level])
+        print(f"wheel acceleration: {describe_wheel(m.get(0x04, 0x0A))}")
+
+    elif a.cmd == "swap-buttons":
+        on = a.state == "on"
+        m.set_buttons({0x01: action(0x01, 0x02 if on else 0x01),
+                       0x02: action(0x01, 0x01 if on else 0x02)})
+        acts = m.get_buttons(bytes([0x01, 0x02]))
+        print(f"left: {describe_action(acts[1])}, right: {describe_action(acts[2])}")
+
+    elif a.cmd == "hscroll-speed":
+        speed = HSCROLL_SPEED[a.speed]
+        m.set_buttons({0x0C: action(0x07, 0xFF, speed), 0x0D: action(0x07, 0x01, speed)})
+        acts = m.get_buttons(bytes([0x0C, 0x0D]))
+        print(f"tilt left: {describe_action(acts[0x0C])}, tilt right: {describe_action(acts[0x0D])}")
+
+    elif a.cmd == "restore":
+        m.set(0x04, 0x03, DEFAULTS["dpi"])
+        m.set(0x04, 0x0A, DEFAULTS["wheel"])
+        for frame in DEFAULTS["buttons"]:
+            m.set(0x02, 0x04, frame)
+        ok = (m.get(0x04, 0x03) == DEFAULTS["dpi"] and m.get(0x04, 0x0A) == DEFAULTS["wheel"]
+              and all(m.get(0x02, 0x04, f[:7]) == f for f in DEFAULTS["buttons"]))
+        print("restored and verified" if ok else "restore sent, but read-back differs; run status")
+
+    elif a.cmd == "factory-reset":
+        m.set(0x00, 0x09, bytes([0x02]))
+        print("factory reset sent; run status to check")
+
+    elif a.cmd == "raw-get":
+        g, c = int(a.group, 16), int(a.command, 16)
+        try:
+            print(hexs(m.get(g, c & 0x7F, bytes(int(x, 16) for x in a.payload))))
+        except NoReply as e:
+            sys.exit(str(e))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except NoReply as e:
+        sys.exit(f"error: {e}")
