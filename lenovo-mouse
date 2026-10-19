@@ -24,6 +24,7 @@ No dependencies beyond Python 3 and systemd's busctl (talks to BlueZ over D-Bus)
 import argparse
 import json
 import random
+import re
 import subprocess
 import sys
 import time
@@ -88,6 +89,24 @@ def busctl(path, iface, method, *args):
     return json.loads(r.stdout)["data"] if r.stdout.strip() else None
 
 
+def bluez_paths():
+    """All BlueZ object paths, as plain text.
+
+    GetManagedObjects is avoided on purpose: some busctl versions fail silently when
+    asked to print it as JSON once a device exposes ManufacturerData (type a{qv})."""
+    r = subprocess.run(["busctl", "--system", "--list", "tree", "org.bluez"],
+                       capture_output=True, text=True, timeout=10)
+    if r.returncode:
+        raise NoReply(r.stderr.strip() or "busctl tree failed")
+    return [l.strip() for l in r.stdout.splitlines() if l.strip().startswith("/org/bluez/")]
+
+
+def uuid_of(path, iface):
+    r = subprocess.run(["busctl", "--system", "--json=short", "get-property", "org.bluez",
+                        path, iface, "UUID"], capture_output=True, text=True, timeout=10)
+    return json.loads(r.stdout)["data"] if r.returncode == 0 and r.stdout.strip() else None
+
+
 class Mouse:
     def __init__(self, mac=None, verbose=False):
         self.verbose = verbose
@@ -95,23 +114,22 @@ class Mouse:
         self.seq = random.randint(0x20, 0xF0)
 
     def _find_chars(self, mac):
-        objs = busctl("/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")[0]
-        # busctl wraps every property value as {"type": ..., "data": ...}; unwrap them
-        objs = {p: {i: {k: v["data"] for k, v in props.items()} for i, props in ifs.items()}
-                for p, ifs in objs.items()}
-        services = [p for p, ifs in objs.items()
-                    if ifs.get("org.bluez.GattService1", {}).get("UUID") == SERVICE_UUID]
+        paths = bluez_paths()
+        svc_re = re.compile(r"/dev_[0-9A-F_]+/service[0-9a-f]+$")
+        char_re = re.compile(r"/char[0-9a-f]+$")
+        services = [p for p in paths if svc_re.search(p)]
         if mac:
             dev = "dev_" + mac.upper().replace(":", "_")
             services = [p for p in services if f"/{dev}/" in p]
+        services = [p for p in services if uuid_of(p, "org.bluez.GattService1") == SERVICE_UUID]
         if not services:
-            sys.exit("Mouse vendor service not found. Is the mouse connected over Bluetooth?")
+            sys.exit("Mouse vendor service not found. Is a Lenovo 6050 connected over Bluetooth?")
         svc = services[0]
         dev = svc.rsplit("/", 1)[0]
-        self.fwpath = next((p for p, ifs in objs.items() if p.startswith(dev + "/")
-                            and ifs.get(CHAR_IFACE, {}).get("UUID") == FIRMWARE_UUID), None)
-        chars = {ifs[CHAR_IFACE]["UUID"]: p for p, ifs in objs.items()
-                 if p.startswith(svc + "/") and CHAR_IFACE in ifs}
+        self.fwpath = next((p for p in paths if p.startswith(dev + "/") and not p.startswith(svc + "/")
+                            and char_re.search(p) and uuid_of(p, CHAR_IFACE) == FIRMWARE_UUID), None)
+        chars = {uuid_of(p, CHAR_IFACE): p for p in paths
+                 if p.startswith(svc + "/") and char_re.search(p)}
         if WRITE_UUID not in chars or NOTIFY_UUID not in chars:
             sys.exit("Vendor characteristics not found on the mouse.")
         return chars[WRITE_UUID], chars[NOTIFY_UUID]
